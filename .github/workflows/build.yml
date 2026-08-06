@@ -1,0 +1,876 @@
+name: Build Git Installer for Intel Mac
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # בדיקה בכל יום ראשון בשעה 03:00 UTC
+    - cron: "0 3 * * 0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-latest-git-intel
+  cancel-in-progress: false
+
+jobs:
+  find-version:
+    name: Find latest stable Git version
+    runs-on: ubuntu-latest
+
+    outputs:
+      git_tag: ${{ steps.version.outputs.git_tag }}
+      git_version: ${{ steps.version.outputs.git_version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+
+    steps:
+      - name: Find latest stable Git version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Finding latest stable Git release..."
+
+          GIT_TAG="$(
+            git ls-remote \
+              --tags \
+              --refs \
+              https://github.com/git/git.git \
+            | awk -F/ '{print $3}' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -n 1
+          )"
+
+          if [[ -z "$GIT_TAG" ]]; then
+            echo "::error::Could not determine the latest Git version."
+            exit 1
+          fi
+
+          GIT_VERSION="${GIT_TAG#v}"
+          RELEASE_TAG="git-${GIT_VERSION}-macos-intel"
+
+          echo "Latest Git tag: $GIT_TAG"
+          echo "Latest Git version: $GIT_VERSION"
+          echo "GitHub release tag: $RELEASE_TAG"
+
+          echo "git_tag=$GIT_TAG" >> "$GITHUB_OUTPUT"
+          echo "git_version=$GIT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+  check-release:
+    name: Check whether release already exists
+    runs-on: ubuntu-latest
+    needs: find-version
+
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+
+    steps:
+      - name: Check GitHub Release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.find-version.outputs.release_tag }}
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # בהרצה ידנית תמיד בונים מחדש
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "Manual workflow run: rebuilding installer."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if gh release view "$RELEASE_TAG" \
+            --repo "$REPOSITORY" \
+            >/dev/null 2>&1; then
+
+            echo "Release $RELEASE_TAG already exists."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release does not exist."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build Intel installer
+    runs-on: macos-15-intel
+
+    needs:
+      - find-version
+      - check-release
+
+    if: needs.check-release.outputs.should_build == 'true'
+
+    env:
+      GIT_TAG: ${{ needs.find-version.outputs.git_tag }}
+      GIT_VERSION: ${{ needs.find-version.outputs.git_version }}
+
+      # המחשב שלך מריץ Ventura 13
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+      INSTALL_PREFIX: /usr/local
+
+      OUTPUT_DIR: ${{ github.workspace }}/output
+      SOURCE_DIR: ${{ github.workspace }}/git-source
+
+      PACKAGE_ROOT: ${{ runner.temp }}/git-package-root
+      PACKAGE_SCRIPTS: ${{ runner.temp }}/git-package-scripts
+      DMG_CONTENTS: ${{ runner.temp }}/git-dmg-contents
+
+      KEYCHAIN_PATH: ${{ runner.temp }}/build-signing.keychain-db
+
+      # סודות לחתימה. כאשר הם לא מוגדרים תתבצע בנייה ללא חתימה.
+      APP_CERTIFICATE_BASE64: ${{ secrets.APP_CERTIFICATE_BASE64 }}
+      APP_CERTIFICATE_PASSWORD: ${{ secrets.APP_CERTIFICATE_PASSWORD }}
+
+      INSTALLER_CERTIFICATE_BASE64: ${{ secrets.INSTALLER_CERTIFICATE_BASE64 }}
+      INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.INSTALLER_CERTIFICATE_PASSWORD }}
+
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+
+      APP_SIGNING_IDENTITY: ${{ secrets.APP_SIGNING_IDENTITY }}
+      INSTALLER_SIGNING_IDENTITY: ${{ secrets.INSTALLER_SIGNING_IDENTITY }}
+
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+
+    steps:
+      - name: Show build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "macOS information:"
+          sw_vers
+
+          echo
+          echo "Processor architecture:"
+          uname -m
+
+          if [[ "$(uname -m)" != "x86_64" ]]; then
+            echo "::error::This workflow must run on an Intel runner."
+            exit 1
+          fi
+
+          echo
+          echo "Xcode information:"
+          xcodebuild -version
+
+          echo
+          echo "macOS SDK:"
+          xcrun --sdk macosx --show-sdk-version
+
+          echo
+          echo "Deployment target:"
+          echo "$MACOSX_DEPLOYMENT_TARGET"
+
+      - name: Prepare directories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf \
+            "$OUTPUT_DIR" \
+            "$SOURCE_DIR" \
+            "$PACKAGE_ROOT" \
+            "$PACKAGE_SCRIPTS" \
+            "$DMG_CONTENTS"
+
+          mkdir -p \
+            "$OUTPUT_DIR" \
+            "$PACKAGE_ROOT" \
+            "$PACKAGE_SCRIPTS" \
+            "$DMG_CONTENTS"
+
+      - name: Download official Git source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone \
+            --depth 1 \
+            --branch "$GIT_TAG" \
+            https://github.com/git/git.git \
+            "$SOURCE_DIR"
+
+          cd "$SOURCE_DIR"
+
+          DOWNLOADED_TAG="$(git describe --tags --exact-match)"
+
+          if [[ "$DOWNLOADED_TAG" != "$GIT_TAG" ]]; then
+            echo "::error::Downloaded tag does not match $GIT_TAG."
+            exit 1
+          fi
+
+          echo "Downloaded Git source tag: $DOWNLOADED_TAG"
+
+      - name: Build Git for Intel and Ventura
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$SOURCE_DIR"
+
+          export MACOSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"
+
+          CPU_COUNT="$(sysctl -n hw.logicalcpu)"
+
+          echo "Building with $CPU_COUNT logical processors..."
+
+          make \
+            -j"$CPU_COUNT" \
+            prefix="$INSTALL_PREFIX" \
+            NO_GETTEXT=YesPlease \
+            NO_TCLTK=YesPlease \
+            NO_PERL_CPAN_FALLBACKS=YesPlease \
+            NO_OPENSSL=YesPlease \
+            APPLE_COMMON_CRYPTO=YesPlease
+
+      - name: Install Git into staging directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$SOURCE_DIR"
+
+          export MACOSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"
+
+          make \
+            prefix="$INSTALL_PREFIX" \
+            DESTDIR="$PACKAGE_ROOT" \
+            NO_GETTEXT=YesPlease \
+            NO_TCLTK=YesPlease \
+            NO_PERL_CPAN_FALLBACKS=YesPlease \
+            NO_OPENSSL=YesPlease \
+            APPLE_COMMON_CRYPTO=YesPlease \
+            install
+
+          GIT_BINARY="$PACKAGE_ROOT/usr/local/bin/git"
+
+          if [[ ! -x "$GIT_BINARY" ]]; then
+            echo "::error::Git executable was not created."
+            exit 1
+          fi
+
+          echo "Built Git version:"
+          "$GIT_BINARY" --version
+
+          echo
+          echo "Binary architecture:"
+          file "$GIT_BINARY"
+
+          if ! file "$GIT_BINARY" | grep -q "x86_64"; then
+            echo "::error::The Git binary is not an Intel x86_64 binary."
+            exit 1
+          fi
+
+      - name: Check minimum supported macOS version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GIT_BINARY="$PACKAGE_ROOT/usr/local/bin/git"
+
+          echo "Build version information:"
+
+          xcrun vtool \
+            -show-build \
+            "$GIT_BINARY" \
+            || otool -l "$GIT_BINARY"
+
+      - name: Check dynamic library dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GIT_BINARY="$PACKAGE_ROOT/usr/local/bin/git"
+
+          echo "Libraries required by Git:"
+          otool -L "$GIT_BINARY"
+
+          if otool -L "$GIT_BINARY" \
+            | grep -E '/usr/local/Cellar|/opt/homebrew|/usr/local/opt'; then
+
+            echo "::error::Git is linked to Homebrew libraries."
+            echo "::error::The installer would not work correctly on another Mac."
+            exit 1
+          fi
+
+          echo "No Homebrew runtime dependencies were found."
+
+      - name: Create installer postinstall script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$PACKAGE_SCRIPTS/postinstall" <<'POSTINSTALL'
+          #!/bin/bash
+
+          set -e
+
+          PATHS_FILE="/etc/paths.d/git-local"
+
+          echo "/usr/local/bin" > "$PATHS_FILE"
+
+          chown root:wheel "$PATHS_FILE"
+          chmod 644 "$PATHS_FILE"
+
+          exit 0
+          POSTINSTALL
+
+          chmod 755 "$PACKAGE_SCRIPTS/postinstall"
+
+      - name: Determine signing availability
+        id: signing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SIGNING_AVAILABLE="true"
+
+          REQUIRED_VALUES=(
+            "$APP_CERTIFICATE_BASE64"
+            "$APP_CERTIFICATE_PASSWORD"
+            "$INSTALLER_CERTIFICATE_BASE64"
+            "$INSTALLER_CERTIFICATE_PASSWORD"
+            "$KEYCHAIN_PASSWORD"
+            "$APP_SIGNING_IDENTITY"
+            "$INSTALLER_SIGNING_IDENTITY"
+            "$APPLE_ID"
+            "$APPLE_TEAM_ID"
+            "$APPLE_APP_PASSWORD"
+          )
+
+          for VALUE in "${REQUIRED_VALUES[@]}"; do
+            if [[ -z "$VALUE" ]]; then
+              SIGNING_AVAILABLE="false"
+              break
+            fi
+          done
+
+          if [[ "$SIGNING_AVAILABLE" == "true" ]]; then
+            echo "Apple signing and notarization are enabled."
+          else
+            echo "::warning::Apple signing secrets are incomplete."
+            echo "::warning::An unsigned installer will be created."
+          fi
+
+          echo "available=$SIGNING_AVAILABLE" >> "$GITHUB_OUTPUT"
+
+      - name: Import Apple certificates
+        if: steps.signing.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_CERTIFICATE_PATH="$RUNNER_TEMP/developer-id-application.p12"
+          INSTALLER_CERTIFICATE_PATH="$RUNNER_TEMP/developer-id-installer.p12"
+
+          printf '%s' "$APP_CERTIFICATE_BASE64" \
+            | base64 --decode \
+            > "$APP_CERTIFICATE_PATH"
+
+          printf '%s' "$INSTALLER_CERTIFICATE_BASE64" \
+            | base64 --decode \
+            > "$INSTALLER_CERTIFICATE_PATH"
+
+          security create-keychain \
+            -p "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          security set-keychain-settings \
+            -lut 21600 \
+            "$KEYCHAIN_PATH"
+
+          security unlock-keychain \
+            -p "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          security import "$APP_CERTIFICATE_PATH" \
+            -P "$APP_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          security import "$INSTALLER_CERTIFICATE_PATH" \
+            -P "$INSTALLER_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          security list-keychains \
+            -d user \
+            -s "$KEYCHAIN_PATH" login.keychain-db
+
+          echo "Available signing identities:"
+          security find-identity \
+            -v \
+            -p codesigning \
+            "$KEYCHAIN_PATH"
+
+      - name: Sign packaged Mach-O files
+        if: steps.signing.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Finding and signing Mach-O files..."
+
+          SIGNED_COUNT=0
+
+          while IFS= read -r -d '' FILE_PATH; do
+            FILE_DESCRIPTION="$(file -b "$FILE_PATH")"
+
+            if [[ "$FILE_DESCRIPTION" == *"Mach-O"* ]]; then
+              echo "Signing: $FILE_PATH"
+
+              codesign \
+                --force \
+                --timestamp \
+                --options runtime \
+                --sign "$APP_SIGNING_IDENTITY" \
+                --keychain "$KEYCHAIN_PATH" \
+                "$FILE_PATH"
+
+              codesign \
+                --verify \
+                --verbose=2 \
+                "$FILE_PATH"
+
+              SIGNED_COUNT=$((SIGNED_COUNT + 1))
+            fi
+          done < <(find "$PACKAGE_ROOT" -type f -print0)
+
+          echo "Signed $SIGNED_COUNT Mach-O files."
+
+          if [[ "$SIGNED_COUNT" -eq 0 ]]; then
+            echo "::error::No Mach-O files were signed."
+            exit 1
+          fi
+
+      - name: Build unsigned PKG
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UNSIGNED_PKG="$OUTPUT_DIR/Git-${GIT_VERSION}-macOS-Intel-unsigned.pkg"
+
+          pkgbuild \
+            --root "$PACKAGE_ROOT" \
+            --scripts "$PACKAGE_SCRIPTS" \
+            --identifier "org.git-scm.git.intel" \
+            --version "$GIT_VERSION" \
+            --install-location "/" \
+            "$UNSIGNED_PKG"
+
+          if [[ ! -f "$UNSIGNED_PKG" ]]; then
+            echo "::error::The PKG installer was not created."
+            exit 1
+          fi
+
+          pkgutil --payload-files "$UNSIGNED_PKG" | head -100
+
+      - name: Sign PKG installer
+        if: steps.signing.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UNSIGNED_PKG="$OUTPUT_DIR/Git-${GIT_VERSION}-macOS-Intel-unsigned.pkg"
+          SIGNED_PKG="$OUTPUT_DIR/Git-${GIT_VERSION}-macOS-Intel.pkg"
+
+          productsign \
+            --sign "$INSTALLER_SIGNING_IDENTITY" \
+            --keychain "$KEYCHAIN_PATH" \
+            "$UNSIGNED_PKG" \
+            "$SIGNED_PKG"
+
+          pkgutil \
+            --check-signature \
+            "$SIGNED_PKG"
+
+          rm -f "$UNSIGNED_PKG"
+
+      - name: Use unsigned PKG when signing is unavailable
+        if: steps.signing.outputs.available != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UNSIGNED_PKG="$OUTPUT_DIR/Git-${GIT_VERSION}-macOS-Intel-unsigned.pkg"
+          FINAL_PKG="$OUTPUT_DIR/Git-${GIT_VERSION}-macOS-Intel.pkg"
+
+          mv "$UNSIGNED_PKG" "$FINAL_PKG"
+
+          echo "::warning::The generated PKG is not digitally signed."
+
+      - name: Notarize signed PKG
+        if: steps.signing.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FINAL_PKG="$OUTPUT_DIR/Git-${GIT_VERSION}-macOS-Intel.pkg"
+
+          xcrun notarytool submit "$FINAL_PKG" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+
+          xcrun stapler staple "$FINAL_PKG"
+          xcrun stapler validate "$FINAL_PKG"
+
+          spctl \
+            --assess \
+            --type install \
+            --verbose=4 \
+            "$FINAL_PKG"
+
+      - name: Test PKG contents
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FINAL_PKG="$OUTPUT_DIR/Git-${GIT_VERSION}-macOS-Intel.pkg"
+          TEST_DIR="$RUNNER_TEMP/pkg-test"
+
+          rm -rf "$TEST_DIR"
+          mkdir -p "$TEST_DIR"
+
+          pkgutil \
+            --expand-full \
+            "$FINAL_PKG" \
+            "$TEST_DIR/expanded"
+
+          TEST_GIT="$TEST_DIR/expanded/Payload/usr/local/bin/git"
+
+          if [[ ! -x "$TEST_GIT" ]]; then
+            echo "::error::Git is missing from the generated installer."
+            exit 1
+          fi
+
+          PACKAGED_VERSION="$("$TEST_GIT" --version)"
+
+          echo "Packaged version: $PACKAGED_VERSION"
+
+          if [[ "$PACKAGED_VERSION" != "git version $GIT_VERSION"* ]]; then
+            echo "::error::The packaged Git version is incorrect."
+            exit 1
+          fi
+
+          if ! file "$TEST_GIT" | grep -q "x86_64"; then
+            echo "::error::Packaged Git is not an Intel binary."
+            exit 1
+          fi
+
+      - name: Create DMG README
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FINAL_PKG="$OUTPUT_DIR/Git-${GIT_VERSION}-macOS-Intel.pkg"
+
+          cp "$FINAL_PKG" "$DMG_CONTENTS/"
+
+          if [[ "${{ steps.signing.outputs.available }}" == "true" ]]; then
+            SIGNING_TEXT="This installer is digitally signed and notarized by Apple."
+          else
+            SIGNING_TEXT="This installer is not digitally signed or notarized."
+          fi
+
+          cat > "$DMG_CONTENTS/README.txt" <<EOF
+          Git ${GIT_VERSION} for Intel Macs
+          =================================
+
+          Compatible architecture:
+          Intel x86_64
+
+          Minimum target:
+          macOS Ventura 13.0
+
+          Installation
+          ------------
+
+          1. Open Git-${GIT_VERSION}-macOS-Intel.pkg
+          2. Follow the installer instructions.
+          3. Close and reopen Terminal.
+          4. Run:
+
+             git --version
+
+          Installation location:
+
+             /usr/local/bin/git
+
+          $SIGNING_TEXT
+
+          Official Git source:
+
+             https://github.com/git/git/tree/${GIT_TAG}
+          EOF
+
+      - name: Create compressed DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FINAL_DMG="$OUTPUT_DIR/Git-${GIT_VERSION}-macOS-Intel.dmg"
+
+          hdiutil create \
+            -volname "Git ${GIT_VERSION} Intel" \
+            -srcfolder "$DMG_CONTENTS" \
+            -format UDZO \
+            -imagekey zlib-level=9 \
+            -ov \
+            "$FINAL_DMG"
+
+          hdiutil verify "$FINAL_DMG"
+
+      - name: Sign DMG
+        if: steps.signing.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FINAL_DMG="$OUTPUT_DIR/Git-${GIT_VERSION}-macOS-Intel.dmg"
+
+          codesign \
+            --force \
+            --timestamp \
+            --sign "$APP_SIGNING_IDENTITY" \
+            --keychain "$KEYCHAIN_PATH" \
+            "$FINAL_DMG"
+
+          codesign \
+            --verify \
+            --verbose=2 \
+            "$FINAL_DMG"
+
+      - name: Notarize DMG
+        if: steps.signing.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FINAL_DMG="$OUTPUT_DIR/Git-${GIT_VERSION}-macOS-Intel.dmg"
+
+          xcrun notarytool submit "$FINAL_DMG" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+
+          xcrun stapler staple "$FINAL_DMG"
+          xcrun stapler validate "$FINAL_DMG"
+
+          spctl \
+            --assess \
+            --type open \
+            --context context:primary-signature \
+            --verbose=4 \
+            "$FINAL_DMG"
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$OUTPUT_DIR"
+
+          FINAL_PKG="Git-${GIT_VERSION}-macOS-Intel.pkg"
+          FINAL_DMG="Git-${GIT_VERSION}-macOS-Intel.dmg"
+
+          shasum -a 256 "$FINAL_PKG" > "${FINAL_PKG}.sha256"
+          shasum -a 256 "$FINAL_DMG" > "${FINAL_DMG}.sha256"
+
+          echo "PKG checksum:"
+          cat "${FINAL_PKG}.sha256"
+
+          echo
+          echo "DMG checksum:"
+          cat "${FINAL_DMG}.sha256"
+
+      - name: Create build information file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ steps.signing.outputs.available }}" == "true" ]]; then
+            SIGNING_STATUS="Signed and notarized"
+          else
+            SIGNING_STATUS="Unsigned and not notarized"
+          fi
+
+          cat > "$OUTPUT_DIR/build-information.txt" <<EOF
+          Git version: ${GIT_VERSION}
+          Git source tag: ${GIT_TAG}
+          Architecture: Intel x86_64
+          Minimum deployment target: macOS 13.0
+          Signing status: ${SIGNING_STATUS}
+          Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          Commit: ${GITHUB_SHA}
+          EOF
+
+      - name: List generated files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Generated files:"
+          ls -lah "$OUTPUT_DIR"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-${{ env.GIT_VERSION }}-macos-intel
+          path: |
+            ${{ env.OUTPUT_DIR }}/Git-${{ env.GIT_VERSION }}-macOS-Intel.dmg
+            ${{ env.OUTPUT_DIR }}/Git-${{ env.GIT_VERSION }}-macOS-Intel.pkg
+            ${{ env.OUTPUT_DIR }}/*.sha256
+            ${{ env.OUTPUT_DIR }}/build-information.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Remove temporary keychain
+        if: always() && steps.signing.outputs.available == 'true'
+        shell: bash
+        run: |
+          security delete-keychain "$KEYCHAIN_PATH" || true
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+
+    needs:
+      - find-version
+      - check-release
+      - build
+
+    if: |
+      always() &&
+      needs.check-release.outputs.should_build == 'true' &&
+      needs.build.result == 'success'
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GIT_VERSION: ${{ needs.find-version.outputs.git_version }}
+      GIT_TAG: ${{ needs.find-version.outputs.git_tag }}
+      RELEASE_TAG: ${{ needs.find-version.outputs.release_tag }}
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: git-${{ env.GIT_VERSION }}-macos-intel
+          path: release-files
+
+      - name: Show release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          find release-files -type f -maxdepth 2 -print
+
+      - name: Read signing status
+        id: info
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SIGNING_STATUS="$(
+            grep '^Signing status:' \
+              release-files/build-information.txt \
+            | cut -d: -f2- \
+            | xargs
+          )"
+
+          echo "signing_status=$SIGNING_STATUS" >> "$GITHUB_OUTPUT"
+
+      - name: Create release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > release-notes.md <<EOF
+          ## Git ${GIT_VERSION} for Intel Mac
+
+          This installer was built automatically from the official Git source:
+
+          \`${GIT_TAG}\`
+
+          ### Compatibility
+
+          - Intel Macs with an \`x86_64\` processor
+          - Targeted for macOS Ventura 13.0 or newer
+          - Installs Git under \`/usr/local/bin\`
+
+          ### Signing status
+
+          ${{ steps.info.outputs.signing_status }}
+
+          ### Installation
+
+          1. Download \`Git-${GIT_VERSION}-macOS-Intel.dmg\`.
+          2. Open the DMG.
+          3. Open the PKG installer.
+          4. Complete the installation.
+          5. Close and reopen Terminal.
+          6. Run:
+
+          \`\`\`bash
+          git --version
+          \`\`\`
+
+          SHA-256 checksum files are included.
+          EOF
+
+      - name: Create or update GitHub Release
+        env:
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" \
+            --repo "$REPOSITORY" \
+            >/dev/null 2>&1; then
+
+            echo "Updating release $RELEASE_TAG..."
+
+            gh release upload "$RELEASE_TAG" \
+              release-files/* \
+              --repo "$REPOSITORY" \
+              --clobber
+
+            gh release edit "$RELEASE_TAG" \
+              --repo "$REPOSITORY" \
+              --title "Git ${GIT_VERSION} for Intel Mac" \
+              --notes-file release-notes.md
+
+          else
+            echo "Creating release $RELEASE_TAG..."
+
+            gh release create "$RELEASE_TAG" \
+              release-files/* \
+              --repo "$REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Git ${GIT_VERSION} for Intel Mac" \
+              --notes-file release-notes.md
+          fi
