@@ -132,7 +132,7 @@ jobs:
             exit 1
           fi
 
-      - name: Build Git for Intel macOS Ventura or newer
+       - name: Build Git for Intel macOS Ventura or newer
         shell: bash
         run: |
           set -euo pipefail
@@ -145,7 +145,6 @@ jobs:
           make -j"$CPU_COUNT" \
             prefix="$INSTALL_PREFIX" \
             NO_GETTEXT=YesPlease \
-            NO_ICONV=YesPlease \
             NO_TCLTK=YesPlease \
             NO_PERL=YesPlease \
             NO_PYTHON=YesPlease \
@@ -167,7 +166,6 @@ jobs:
             prefix="$INSTALL_PREFIX" \
             DESTDIR="$PACKAGE_ROOT" \
             NO_GETTEXT=YesPlease \
-            NO_ICONV=YesPlease \
             NO_TCLTK=YesPlease \
             NO_PERL=YesPlease \
             NO_PYTHON=YesPlease \
@@ -182,6 +180,14 @@ jobs:
 
           if [[ ! -x "$GIT_BINARY" ]]; then
             echo "::error::Git was not installed into the staging directory."
+            exit 1
+          fi
+
+          "$GIT_BINARY" --version
+          file "$GIT_BINARY"
+
+          if ! file "$GIT_BINARY" | grep -q 'x86_64'; then
+            echo "::error::The generated Git binary is not Intel x86_64."
             exit 1
           fi
 
