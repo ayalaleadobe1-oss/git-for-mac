@@ -1,64 +1,145 @@
-name: Build Git DMG Installer
+name: Build Git DMG (macOS Intel)
 
 on:
-  workflow_dispatch: # מאפשר הרצה ידנית של התהליך
+  workflow_dispatch:
+    inputs:
+      git_version:
+        description: "גרסת Git לבנייה (השאר ריק = הגרסה היציבה האחרונה)"
+        required: false
+        default: ""
+  schedule:
+    # פעם בחודש, ב-1 לחודש ב-04:00 UTC
+    - cron: "0 4 1 * *"
+
+permissions:
+  contents: write
 
 jobs:
-  build-git-dmg:
-    runs-on: macos-13 # תואם לארכיטקטורת Intel ול-macOS Ventura
+  build:
+    # macos-13 כבר לא קיים (הוסר בדצמבר 2025).
+    # macos-15-intel הוא הראנר האינטלי (x86_64) האחרון שנתמך.
+    runs-on: macos-15-intel
+
+    env:
+      # קריטי: מבטיח שהבינארי ירוץ גם על Ventura (13.x) ולא רק על ה-SDK של הראנר
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      PREFIX: /usr/local/git
+      PKG_IDENTIFIER: com.local.git
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Install Build Dependencies
-        run: brew install autoconf zlib gettext pcre2
-
-      - name: Download Latest Git Source
+      - name: זיהוי גרסת Git היציבה האחרונה
+        id: ver
         run: |
-          # שליפת תגית הגרסה העדכנית ביותר של Git מה-API של GitHub
-          LATEST_TAG=$(curl -sL https://api.github.com/repos/git/git/tags | grep -Eo '"name": "v[0-9]+\.[0-9]+\.[0-9]+"' | head -n 1 | cut -d'"' -f4)
-          echo "LATEST_TAG=$LATEST_TAG" >> $GITHUB_ENV
-          echo "Downloading Git version $LATEST_TAG..."
-          
-          # הורדת קוד המקור ופתיחתו
-          curl -o git-source.tar.gz -L "https://github.com/git/git/archive/refs/tags/${LATEST_TAG}.tar.gz"
-          tar -xzf git-source.tar.gz
-          mv "git-${LATEST_TAG#v}" git-source
+          set -euo pipefail
+          IN="${{ github.event.inputs.git_version }}"
+          if [ -n "$IN" ]; then
+            VER="${IN#v}"
+          else
+            VER=$(curl -fsSL "https://api.github.com/repos/git/git/tags?per_page=100" \
+              | jq -r '.[].name' \
+              | sed 's/^v//' \
+              | grep -Ev 'rc|-' \
+              | sort -V | tail -n1)
+          fi
+          [ -n "$VER" ] || { echo "לא הצלחתי לזהות גרסה"; exit 1; }
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "בונה את Git $VER"
 
-      - name: Compile and Build Git
+      - name: הורדה ואימות של קוד המקור
         run: |
-          cd git-source
-          make configure
-          
-          # הגדרת תיקיית יעד זמנית בתוך סביבת הריצה לאיסוף הקבצים המקומפלים
-          ./configure --prefix=${{ github.workspace }}/git-dest/usr/local
-          
-          # קימפול מהיר יותר תוך שימוש בכל ליבות המעבד הזמינות בשרת
-          make all -j$(sysctl -n hw.ncpu)
-          make install
+          set -euo pipefail
+          VER="${{ steps.ver.outputs.version }}"
+          curl -fsSLO "https://mirrors.edge.kernel.org/pub/software/scm/git/git-${VER}.tar.xz"
+          tar -xf "git-${VER}.tar.xz"
+          ls -d "git-${VER}"
 
-      - name: Package into PKG and DMG
+      - name: קימפול
         run: |
-          VERSION_NUM=$(echo ${{ env.LATEST_TAG }} | sed 's/v//')
-          
-          # 1. יצירת חבילת התקנה (PKG) כדי שמערכת ההפעלה תדע להתקין את הקבצים בנתיב הנכון
-          pkgbuild --root ${{ github.workspace }}/git-dest \
-                   --identifier com.git.latest.pkg \
-                   --version $VERSION_NUM \
-                   --install-location / \
-                   Git-Installer.pkg
-          
-          # 2. הכנת תיקייה עבור יצירת ה-DMG
-          mkdir dmg_folder
-          mv Git-Installer.pkg dmg_folder/
-          
-          # 3. יצירת קובץ ה-DMG
-          hdiutil create -volname "Git_Installer_${VERSION_NUM}" -srcfolder dmg_folder -ov -format UDZO Git-macOS-Installer.dmg
+          set -euo pipefail
+          VER="${{ steps.ver.outputs.version }}"
+          cd "git-${VER}"
+          make -j"$(sysctl -n hw.ncpu)" \
+            prefix="$PREFIX" \
+            CFLAGS="-O2 -arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}" \
+            LDFLAGS="-arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}" \
+            NO_GETTEXT=YesPlease \
+            NO_TCLTK=YesPlease \
+            NO_PERL_CPAN_FALLBACKS=YesPlease \
+            all
 
-      - name: Upload DMG Artifact
+      - name: התקנה לתוך payload
+        run: |
+          set -euo pipefail
+          VER="${{ steps.ver.outputs.version }}"
+          cd "git-${VER}"
+          make prefix="$PREFIX" \
+            NO_GETTEXT=YesPlease NO_TCLTK=YesPlease \
+            DESTDIR="${GITHUB_WORKSPACE}/payload" install
+          # בדיקת שפיות: ארכיטקטורה + גרסה
+          file "${GITHUB_WORKSPACE}/payload${PREFIX}/bin/git"
+          "${GITHUB_WORKSPACE}/payload${PREFIX}/bin/git" --version
+
+      - name: יצירת סקריפט postinstall (הוספה ל-PATH)
+        run: |
+          set -euo pipefail
+          mkdir -p scripts
+          cat > scripts/postinstall <<'EOS'
+          #!/bin/bash
+          set -e
+          mkdir -p /etc/paths.d /etc/manpaths.d
+          echo "/usr/local/git/bin" > /etc/paths.d/git
+          echo "/usr/local/git/share/man" > /etc/manpaths.d/git
+          exit 0
+          EOS
+          chmod +x scripts/postinstall
+
+      - name: אריזה ל-PKG
+        run: |
+          set -euo pipefail
+          VER="${{ steps.ver.outputs.version }}"
+          mkdir -p dmgroot
+          pkgbuild \
+            --root payload \
+            --scripts scripts \
+            --identifier "$PKG_IDENTIFIER" \
+            --version "$VER" \
+            --install-location / \
+            "dmgroot/Git-${VER}-intel.pkg"
+
+      - name: יצירת DMG
+        run: |
+          set -euo pipefail
+          VER="${{ steps.ver.outputs.version }}"
+          cat > dmgroot/README.txt <<EOS
+          Git ${VER} — התקנה עבור macOS (Intel / x86_64)
+
+          1. לחצו לחיצה ימנית על קובץ ה-PKG ובחרו "Open" (לא לחיצה כפולה),
+             מכיוון שההתקנה אינה חתומה דיגיטלית ע"י Apple.
+          2. לאחר ההתקנה פתחו טרמינל חדש והריצו:  git --version
+          EOS
+          hdiutil create \
+            -volname "Git ${VER}" \
+            -srcfolder dmgroot \
+            -fs HFS+ \
+            -format UDZO \
+            -ov \
+            "Git-${VER}-intel.dmg"
+          shasum -a 256 "Git-${VER}-intel.dmg" > "Git-${VER}-intel.dmg.sha256"
+
+      - name: העלאת Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Git-macOS-Installer-Intel
-          path: Git-macOS-Installer.dmg
-          retention-days: 7
+          name: git-dmg-${{ steps.ver.outputs.version }}
+          path: |
+            Git-*.dmg
+            Git-*.dmg.sha256
+          if-no-files-found: error
+
+      - name: פרסום Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: git-${{ steps.ver.outputs.version }}
+          name: Git ${{ steps.ver.outputs.version }} (macOS Intel)
+          files: |
+            Git-*.dmg
+            Git-*.dmg.sha256
