@@ -16,12 +16,12 @@ permissions:
 
 jobs:
   build:
-    # macos-13 כבר לא קיים (הוסר בדצמבר 2025).
-    # macos-15-intel הוא הראנר האינטלי (x86_64) האחרון שנתמך.
+    # macos-13 הוסר בדצמבר 2025.
+    # macos-15-intel הוא הראנר האינטלי (x86_64) האחרון שנתמך (עד אוגוסט 2027).
     runs-on: macos-15-intel
 
     env:
-      # קריטי: מבטיח שהבינארי ירוץ גם על Ventura (13.x) ולא רק על ה-SDK של הראנר
+      # קריטי: מבטיח שהבינארי ירוץ גם על Ventura 13.x ולא רק על ה-SDK של הראנר
       MACOSX_DEPLOYMENT_TARGET: "13.0"
       PREFIX: /usr/local/git
       PKG_IDENTIFIER: com.local.git
@@ -45,7 +45,7 @@ jobs:
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "בונה את Git $VER"
 
-      - name: הורדה ואימות של קוד המקור
+      - name: הורדת קוד המקור
         run: |
           set -euo pipefail
           VER="${{ steps.ver.outputs.version }}"
@@ -75,20 +75,38 @@ jobs:
           make prefix="$PREFIX" \
             NO_GETTEXT=YesPlease NO_TCLTK=YesPlease \
             DESTDIR="${GITHUB_WORKSPACE}/payload" install
-          # בדיקת שפיות: ארכיטקטורה + גרסה
-          file "${GITHUB_WORKSPACE}/payload${PREFIX}/bin/git"
-          "${GITHUB_WORKSPACE}/payload${PREFIX}/bin/git" --version
 
-      - name: יצירת סקריפט postinstall (הוספה ל-PATH)
+      - name: בדיקת שפיות של הבינארי
+        run: |
+          set -euo pipefail
+          BIN="${GITHUB_WORKSPACE}/payload${PREFIX}/bin/git"
+          file "$BIN"
+          file "$BIN" | grep -q "x86_64" || { echo "שגיאה: הבינארי אינו x86_64"; exit 1; }
+          # ודא שאין תלות בספריות Homebrew (/opt/homebrew או /usr/local/opt)
+          if otool -L "$BIN" | grep -Eq "/opt/homebrew|/usr/local/opt"; then
+            echo "שגיאה: נמצאה תלות ב-Homebrew, הבינארי לא יעבוד במכונת היעד"
+            otool -L "$BIN"
+            exit 1
+          fi
+          otool -L "$BIN"
+          "$BIN" --version
+
+      - name: יצירת סקריפט postinstall
         run: |
           set -euo pipefail
           mkdir -p scripts
           cat > scripts/postinstall <<'EOS'
           #!/bin/bash
           set -e
-          mkdir -p /etc/paths.d /etc/manpaths.d
-          echo "/usr/local/git/bin" > /etc/paths.d/git
+          mkdir -p /etc/paths.d /etc/manpaths.d /usr/local/bin
+          echo "/usr/local/git/bin"       > /etc/paths.d/git
           echo "/usr/local/git/share/man" > /etc/manpaths.d/git
+          # סימלינקים ל-/usr/local/bin, שקודם ל-/usr/bin ב-PATH.
+          # בלי זה, /usr/bin/git (ה-stub של Apple) גובר על ההתקנה.
+          for f in /usr/local/git/bin/*; do
+            [ -e "$f" ] || continue
+            ln -sf "$f" "/usr/local/bin/$(basename "$f")"
+          done
           exit 0
           EOS
           chmod +x scripts/postinstall
@@ -112,10 +130,20 @@ jobs:
           VER="${{ steps.ver.outputs.version }}"
           cat > dmgroot/README.txt <<EOS
           Git ${VER} — התקנה עבור macOS (Intel / x86_64)
+          נבנה עבור macOS 13 (Ventura) ומעלה.
 
+          התקנה:
           1. לחצו לחיצה ימנית על קובץ ה-PKG ובחרו "Open" (לא לחיצה כפולה),
              מכיוון שההתקנה אינה חתומה דיגיטלית ע"י Apple.
-          2. לאחר ההתקנה פתחו טרמינל חדש והריצו:  git --version
+          2. אשרו את האזהרה ועברו את שלבי ההתקנה.
+          3. פתחו חלון טרמינל חדש והריצו:
+                which -a git
+             הפלט הראשון צריך להיות /usr/local/bin/git
+                git --version
+
+          הסרה:
+             sudo rm -rf /usr/local/git /etc/paths.d/git /etc/manpaths.d/git
+             sudo find /usr/local/bin -type l -lname '/usr/local/git/*' -delete
           EOS
           hdiutil create \
             -volname "Git ${VER}" \
